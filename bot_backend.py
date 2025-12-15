@@ -1,159 +1,198 @@
+import os
 import joblib
-import fitz
+import uuid
+import fitz  # PyMuPDF for PDF processing
+from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from sentence_transformers import CrossEncoder
+from typing import List
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
-from sentence_transformers import CrossEncoder
 
-# Intent model
+
+# Load environment variables
+load_dotenv()
+
+# Load your intent classifier
 intent_classifier = joblib.load("ml/intent_classifier.pkl")
 
-# Embeddings
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
 
-# Load FAISS (BUILT FROM SQL)
+# Initialize embeddings
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# Load FAISS vectorstore
 vectorstore = FAISS.load_local(
     "vectorstore/faiss_index",
     embeddings,
     allow_dangerous_deserialization=True
 )
-
 retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
 # LLM
 llm = ChatOllama(model="llama3:8b", temperature=0.3)
 
 # Re-ranker
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
 
-# PDF memory
+# PDF memory store
 pdf_vectorstores = {}
 
 
-def predict_intent(query):
-    return intent_classifier.predict([query])[0]
+# =====================================================
+#   SYSTEM PROMPT
+# =====================================================
+SYSTEM_PROMPT = """
+You are Cy-Bot, a friendly and empathetic guide for Kerala's cyber laws.
+
+GREETING RESPONSES:
+1. Theses queries response must be simple very short and direct and end with the question and aim to help the user .
+
+CRITICAL SCOPE RULES:
+1. Your PRIMARY function is to answer questions specifically about Kerala's cyber laws, cybersecurity, digital rights, and related legal matters.
+2. If a question is CLEARLY outside this scope (e.g., about national politics, general knowledge, personal advice, other states' laws), you MUST politely decline to answer.
+3. You can answer general cybersecurity questions that are relevant to Kerala context.
+4. You MUST indicate the source of your information in your response.
+
+SOURCE ATTRIBUTION FORMAT:
+- If information comes from Kerala cyber laws knowledge base: "Based on Kerala's cyber laws..."
+- If information comes from uploaded PDF: "According to the document you provided..."
+- If information comes from both: "Based on Kerala's cyber laws and the document you provided..."
+- If no relevant information found: "I couldn't find specific information about this in Kerala's cyber laws or your uploaded documents."
+
+CRITICAL FORMATTING RULES:
+1. You MUST format your response using HTML for display in a web browser.
+2. Use <p> and </p> tags for paragraphs.
+3. Use <strong> and </strong> tags for important terms.
+4. Do NOT use asterisks (*) for bolding.
+5. There should be a blank line between each paragraph.
+
+OTHER RULES:
+- Be empathetic and polite.
+- You are NOT a lawyer. Do not give legal advice.
+- Base your answers ONLY on the provided context.
+
+Always start with source attribution, then provide the answer if within scope, or politely decline if out of scope.
+"""
 
 
-def process_pdf(pdf_id, file_path):
-    doc = fitz.open(file_path)
-    text = "".join([p.get_text() for p in doc])
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000, chunk_overlap=200
-    )
-
-    docs = [
-        Document(page_content=c, metadata={"source": "pdf"})
-        for c in splitter.split_text(text)
-    ]
-
-    pdf_vectorstores[pdf_id] = FAISS.from_documents(docs, embeddings)
+# =====================================================
+#   Intent Prediction
+# =====================================================
+def predict_intent(query: str) -> str:
+    try:
+        return intent_classifier.predict([query])[0]
+    except Exception as e:
+        return f"IntentError: {e}"
 
 
-def remove_pdf_from_memory(pdf_id):
-    pdf_vectorstores.pop(pdf_id, None)
+# =====================================================
+#   PDF PROCESSING
+# =====================================================
+def process_pdf(pdf_id: str, file_path: str):
+    try:
+        doc = fitz.open(file_path)
+        text = ""
 
+        for page in doc:
+            text += page.get_text()
 
-def get_bot_response(user_question, has_pdf=False, pdf_id=None):
-    intent = predict_intent(user_question)
-
-    # =====================================================
-    # 1️⃣ GREETING (NO LLM, NO FAISS)
-    # =====================================================
-    if intent == "greeting":
-        return (
-            "<p>Hello! 👋</p>"
-            "<p>I’m <strong>Cy-Bot</strong>, your Kerala Cyber Law Assistant.</p>"
-            "<p>How can I help you today regarding cybercrime or digital safety?</p>"
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
         )
+        chunks = text_splitter.split_text(text)
 
-    # =====================================================
-    # 2️⃣ REPORTING / EMERGENCY INTENT (DIRECT RESPONSE)
-    # =====================================================
-    if intent == "reporting":
-        return (
-            "<p><strong>Based on Kerala cybercrime reporting procedures:</strong></p>"
-            "<p>If your phone or account has been hacked:</p>"
-            "<ul>"
-            "<li>Immediately disconnect the device from the internet</li>"
-            "<li>Change passwords for email, bank, and social media</li>"
-            "<li>Enable two-factor authentication</li>"
-            "<li>Call <strong>1930</strong> to report cyber fraud</li>"
-            "<li>File a complaint at "
-            "<a href='https://cybercrime.gov.in' target='_blank'>cybercrime.gov.in</a>"
-            "</li>"
-            "</ul>"
-        )
+        documents = [
+            Document(page_content=chunk,
+                     metadata={"source": "pdf", "pdf_id": pdf_id})
+            for chunk in chunks
+        ]
 
-    # =====================================================
-    # 3️⃣ NORMAL RAG FLOW (LAW / SCAM / PDF QUESTIONS)
-    # =====================================================
-    docs = retriever.invoke(user_question)
+        pdf_vectorstore = FAISS.from_documents(documents, embeddings)
+        pdf_vectorstores[pdf_id] = pdf_vectorstore
 
-    # Add PDF context if available
-    if has_pdf and pdf_id in pdf_vectorstores:
-        pdf_retriever = pdf_vectorstores[pdf_id].as_retriever(
-            search_kwargs={"k": 3}
-        )
-        pdf_docs = pdf_retriever.invoke(user_question)
-        docs = docs + pdf_docs
+        return True
 
-    # =====================================================
-    # 4️⃣ NO CONTEXT FOUND → SAFE RESPONSE
-    # =====================================================
-    if not docs:
-        return (
-            "<p><strong>I couldn’t find specific information</strong> about this "
-            "in Kerala’s cyber laws or your uploaded documents.</p>"
-            "<p>You may try rephrasing your question or ask about reporting "
-            "procedures, cyber scams, or legal sections.</p>"
-        )
+    except Exception as e:
+        print(f"Error processing PDF: {e}")
+        raise e
 
-    # =====================================================
-    # 5️⃣ RE-RANKING (QUALITY CONTROL)
-    # =====================================================
-    pairs = [[user_question, d.page_content] for d in docs]
-    scores = reranker.predict(pairs)
 
-    docs = [
-        d for d, _ in sorted(
-            zip(docs, scores),
-            key=lambda x: x[1],
-            reverse=True
-        )[:3]
-    ]
+def remove_pdf_from_memory(pdf_id: str):
+    if pdf_id in pdf_vectorstores:
+        del pdf_vectorstores[pdf_id]
 
-    context = "\n\n".join(d.page_content for d in docs)
 
-    # =====================================================
-    # 6️⃣ CLEAN SYSTEM PROMPT (NO INTRODUCTION LOOP)
-    # =====================================================
-    prompt = f"""
-You are Cy-Bot, a Kerala Cyber Law Assistant.
+# =====================================================
+#   MAIN FUNCTION: BOT RESPONSE
+# =====================================================
+# =====================================================
+#   MAIN FUNCTION: BOT RESPONSE
+# =====================================================
+def get_bot_response(user_question: str, has_pdf: bool = False, pdf_id: str = None) -> str:
+    # --- ADDING THE TRY/EXCEPT BLOCK BACK ---
+    try:
+        intent = predict_intent(user_question)
 
-Rules:
-1. Answer ONLY using the context below.
-2. If information is from Kerala cyber laws, say:
-   "Based on Kerala's cyber laws..."
-3. If information is from uploaded PDF, say:
-   "According to the document you provided..."
-4. If both are used, mention both.
-5. Do NOT introduce yourself.
-6. Use simple, clear language.
-7. Format response in HTML using <p>, <ul>, <li>, <strong>.
+        # Retrieve context
+        try:
+            docs = retriever.invoke(user_question)
+        except AttributeError:
+            docs = retriever.get_relevant_documents(user_question)
+
+        if has_pdf and pdf_id in pdf_vectorstores:
+            pdf_retriever = pdf_vectorstores[pdf_id].as_retriever(search_kwargs={"k": 5})
+            try:
+                pdf_docs = pdf_retriever.invoke(user_question)
+            except AttributeError:
+                pdf_docs = pdf_retriever.get_relevant_documents(user_question)
+
+            docs = docs + pdf_docs
+
+        # Re-rank documents
+        if docs:
+            rerank_pairs = [[user_question, d.page_content] for d in docs]
+            scores = reranker.predict(rerank_pairs)
+
+            scored_docs = list(zip(docs, scores))
+            scored_docs.sort(key=lambda x: x[1], reverse=True)
+
+            docs = [doc for doc, _ in scored_docs[:3]]
+
+        context = "\n\n".join([d.page_content for d in docs]) or "No relevant context found."
+
+        prompt = f"""
+{SYSTEM_PROMPT}
+
+Intent: {intent}
 
 Context:
 {context}
 
-Question:
-{user_question}
+Question: {user_question}
 
 Answer:
 """
 
-    response = llm.invoke(prompt)
-    return response.content.strip()
+        response = llm.invoke(prompt)
+        return response.content.strip()
+
+    # --- ADDING THE TRY/EXCEPT BLOCK BACK ---
+    except Exception as e:
+        return f"[Backend Error] {str(e)}"
+# =====================================================
+#   MAIN FUNCTION: BOT RESPONSE
+# =====================================================
+
+# =====================================================
+#   LOCAL TESTING
+# =====================================================
+if __name__ == "__main__":
+    print("✅ Cy-Bot backend loaded successfully.")
+    while True:
+        q = input("\nYou: ")
+        if q.lower() in ["exit", "quit"]:
+            break
+        print("Cy-Bot:", get_bot_response(q))
